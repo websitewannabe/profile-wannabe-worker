@@ -3,18 +3,19 @@
     "version": "1.0.0",
     "private": true,
     "scripts": {
-      "start": "tsx worker/index.ts"
+        "start": "tsx worker/index.ts"
     },
     "dependencies": {
-      "bullmq": "^4.0.0",
-      "ioredis": "^5.0.0",
-      "@supabase/supabase-js": "^2.0.0"
+        "@supabase/supabase-js": "^2.0.0",
+        "bullmq": "^4.0.0",
+        "dotenv": "^17.3.1",
+        "ioredis": "^5.0.0"
     },
     "devDependencies": {
-      "tsx": "^4.0.0",
-      "typescript": "^5.0.0"
+        "tsx": "^4.0.0",
+        "typescript": "^5.0.0"
     },
     "engines": {
-      "node": ">=20"
+        "node": ">=20"
     }
-  }
+}
