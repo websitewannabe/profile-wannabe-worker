@@ -162,7 +162,7 @@ new Worker(
 // enqueue call ensures at-most-one audit per location is queued at a time.
 
 new Worker(
-  'profile_audit',
+  'profile_audit_v1',
   handleProfileAuditV1,
   {
     connection: redisConnection,
