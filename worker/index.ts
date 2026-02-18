@@ -7,6 +7,7 @@ import { handleClientOnboardingEmail } from './jobs/clientOnboardingEmail'
 import { handleClientOnboardingReminder } from './jobs/clientOnboardingReminder'
 import { handleAccessGrantedOnboarding } from './jobs/accessGrantedOnboarding'
 import { handleVerifyGbpAccess } from './jobs/verifyGbpAccess'
+import { handleProfileAuditV1 } from './jobs/profileAuditV1'
 import type { TenantJobPayload } from './types'
 
 // ─── Runtime validation ───────────────────────────────────────────────────────
@@ -149,6 +150,26 @@ new Worker(
   },
 ).on('failed', (job, err) => {
   console.error('[client_onboarding_email] Job failed', {
+    jobId:   job?.id,
+    attempt: job?.attemptsMade,
+    error:   err instanceof Error ? err.message : String(err),
+  })
+})
+
+// ─── profile_audit worker ──────────────────────────────────────────────────────
+//
+// Runs profile_audit_v1 jobs.  Stable jobId (audit-v1:<locationId>) in the
+// enqueue call ensures at-most-one audit per location is queued at a time.
+
+new Worker(
+  'profile_audit',
+  handleProfileAuditV1,
+  {
+    connection: redisConnection,
+    concurrency: 3,
+  },
+).on('failed', (job, err) => {
+  console.error('[profile_audit] Job failed', {
     jobId:   job?.id,
     attempt: job?.attemptsMade,
     error:   err instanceof Error ? err.message : String(err),

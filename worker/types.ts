@@ -198,6 +198,57 @@ export interface ClientOnboardingReminderPayload {
   initiatedByUserId: string
 }
 
+// ─── profile_audit_v1 job ─────────────────────────────────────────────────────
+
+export interface ProfileAuditV1Payload {
+  /** Tenant identifier — all DB queries must be scoped to this. */
+  clientId: string
+
+  /** UUID primary key of the gbp_locations row to audit. */
+  gbpLocationId: string
+}
+
+// ─── profile_audit_v1 internal types ─────────────────────────────────────────
+
+export type AuditSeverity = 'high' | 'med' | 'low'
+
+export interface AuditRecommendation {
+  title:          string
+  why_it_matters: string
+  severity:       AuditSeverity
+  suggested_fix:  string
+}
+
+export interface AuditScoreDimensions {
+  completeness: number   // 0–50
+  reputation:   number   // 0–30
+  activity:     number   // 0–20
+}
+
+export interface AuditReviewStats {
+  count:           number
+  averageRating:   number | null
+  /** Number of reviews without a reply (optional — computed from local DB). */
+  unrepliedCount?: number
+  /** Where the aggregate data was sourced from. */
+  source:          'gbp_payload' | 'reviews_api' | 'db'
+}
+
+export interface AuditPerformanceBaseline {
+  periodDays:             number
+  viewsSearchTotal:       number
+  viewsMapsTotal:         number
+  viewsTotal:             number
+  actionsWebsiteTotal:    number
+  actionsPhoneTotal:      number
+  actionsDirectionsTotal: number
+  daysWithData:           number
+  /** True when performance data could not be fully retrieved. */
+  partial?:               boolean
+  /** Human-readable reason when partial is true. */
+  partialReason?:         string
+}
+
 // ─── notification_deliveries row shape ────────────────────────────────────────
 
 export interface NotificationDeliveryRow {

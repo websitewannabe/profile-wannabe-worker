@@ -61,6 +61,19 @@ export const clientOnboardingEmailQueue = new Queue("client_onboarding_email", {
   },
 })
 
+export const profileAuditQueue = new Queue("profile_audit", {
+  connection: redisConnection,
+  defaultJobOptions: {
+    attempts: 3,
+    backoff: {
+      type: "exponential",
+      delay: 15_000, // 15 s → 30 s → 60 s
+    },
+    removeOnComplete: { count: 500 },
+    removeOnFail:     { count: 500 },
+  },
+})
+
 export const notificationDeliveryQueue = new Queue("notification_delivery", {
   connection: redisConnection,
   defaultJobOptions: {
