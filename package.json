@@ -6,6 +6,7 @@
         "start": "tsx worker/index.ts"
     },
     "dependencies": {
+        "@sendgrid/mail": "^8.1.6",
         "@supabase/supabase-js": "^2.0.0",
         "bullmq": "^4.0.0",
         "dotenv": "^17.3.1",
