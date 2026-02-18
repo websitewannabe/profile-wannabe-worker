@@ -3,9 +3,10 @@
  *
  * BullMQ job handler: profile_audit_v1
  *
- * Input:  { clientId: string, gbpLocationId: string }
- *         gbpLocationId = UUID primary key of gbp_locations
- * Job ID: audit-v1:<gbpLocationId>  (stable — ensures idempotency via BullMQ dedup)
+ * Input:  { clientId, profileId, locationId, initiatedByUserId }
+ *         locationId = UUID primary key of gbp_locations (global job contract field)
+ *         profileId / initiatedByUserId may be null for system-initiated audits
+ * Job ID: audit-v1:<locationId>  (stable — ensures idempotency via BullMQ dedup)
  *
  * Steps:
  *   1.  Validate payload
@@ -187,14 +188,26 @@ function assertPayload(data: unknown): asserts data is ProfileAuditV1Payload {
     throw new Error('[profileAuditV1] Job data must be a non-null object')
   }
 
-  const record  = data as Record<string, unknown>
-  const missing = (['clientId', 'gbpLocationId'] as const).filter(
+  const record = data as Record<string, unknown>
+
+  // clientId and locationId must be non-empty strings.
+  const missingRequired = (['clientId', 'locationId'] as const).filter(
     f => typeof record[f] !== 'string' || record[f] === '',
   )
-
-  if (missing.length > 0) {
+  if (missingRequired.length > 0) {
     throw new Error(
-      `[profileAuditV1] Job is missing required fields: ${missing.join(', ')}`,
+      `[profileAuditV1] Job is missing required fields: ${missingRequired.join(', ')}`,
+    )
+  }
+
+  // profileId and initiatedByUserId must be explicitly present as string or null.
+  // undefined means the caller forgot to include the field — reject it.
+  const invalidNullable = (['profileId', 'initiatedByUserId'] as const).filter(
+    f => record[f] !== null && typeof record[f] !== 'string',
+  )
+  if (invalidNullable.length > 0) {
+    throw new Error(
+      `[profileAuditV1] Job has invalid nullable fields (expected string or null): ${invalidNullable.join(', ')}`,
     )
   }
 }
@@ -213,25 +226,25 @@ function assertPayload(data: unknown): asserts data is ProfileAuditV1Payload {
  * @throws if the location doesn't exist or its account belongs to a different client.
  */
 async function loadAndVerifyLocation(
-  clientId:      string,
-  gbpLocationId: string,
+  clientId:   string,
+  locationId: string,
 ): Promise<GbpLocationRow> {
   // ── 1. Load the location row ───────────────────────────────────────────────
   const { data: locData, error: locError } = await supabase
     .from('gbp_locations')
     .select('id, location_id, account_id, name')
-    .eq('id', gbpLocationId)
+    .eq('id', locationId)
     .maybeSingle()
 
   if (locError) {
     throw new Error(
-      `[profileAuditV1] DB error loading gbp_locations row for gbpLocationId=${gbpLocationId}: ${locError.message}`,
+      `[profileAuditV1] DB error loading gbp_locations row for locationId=${locationId}: ${locError.message}`,
     )
   }
 
   if (!locData) {
     throw Object.assign(
-      new Error(`[profileAuditV1] Location ${gbpLocationId} not found`),
+      new Error(`[profileAuditV1] Location ${locationId} not found`),
       { [Symbol.for('bullmq:skipRetry')]: true },
     )
   }
@@ -257,7 +270,7 @@ async function loadAndVerifyLocation(
   if (!accountData) {
     throw Object.assign(
       new Error(
-        `[profileAuditV1] Tenant violation — location ${gbpLocationId} does not belong to client ${clientId}`,
+        `[profileAuditV1] Tenant violation — location ${locationId} does not belong to client ${clientId}`,
       ),
       { [Symbol.for('bullmq:skipRetry')]: true },
     )
@@ -751,7 +764,7 @@ function generateRecommendations(ctx: ScoringContext): AuditRecommendation[] {
 
 async function writeAuditRow(
   clientId:            string,
-  gbpLocationId:       string,
+  locationId:          string,
   score:               number,
   auditJson:           Record<string, unknown>,
   recommendationsJson: AuditRecommendation[],
@@ -760,7 +773,7 @@ async function writeAuditRow(
     .from('profile_audits')
     .insert({
       client_id:            clientId,
-      gbp_location_id:      gbpLocationId,
+      gbp_location_id:      locationId,
       audit_version:        'v1',
       score,
       audit_json:           auditJson,
@@ -772,7 +785,7 @@ async function writeAuditRow(
 
   if (error) {
     throw new Error(
-      `[profileAuditV1] DB error writing profile_audits row for gbpLocationId=${gbpLocationId}: ${error.message}`,
+      `[profileAuditV1] DB error writing profile_audits row for locationId=${locationId}: ${error.message}`,
     )
   }
 
@@ -784,22 +797,22 @@ async function writeAuditRow(
 export async function handleProfileAuditV1(job: Job): Promise<void> {
   // ── 1. Validate payload ────────────────────────────────────────────────────
   assertPayload(job.data)
-  const { clientId, gbpLocationId } = job.data
+  const { clientId, locationId } = job.data
 
   console.log('[profileAuditV1] Job started', {
-    jobId:         job.id,
+    jobId:      job.id,
     clientId,
-    gbpLocationId,
-    attempt:       job.attemptsMade + 1,
+    locationId,
+    attempt:    job.attemptsMade + 1,
   })
 
   // ── 2. Load & verify location ownership via gbp_accounts ──────────────────
-  const location = await loadAndVerifyLocation(clientId, gbpLocationId)
+  const location = await loadAndVerifyLocation(clientId, locationId)
 
   console.log('[profileAuditV1] Tenant ownership verified', {
     jobId:           job.id,
     clientId,
-    gbpLocationId,
+    locationId,
     gbpResourceName: location.location_id,
   })
 
@@ -812,44 +825,44 @@ export async function handleProfileAuditV1(job: Job): Promise<void> {
   console.log('[profileAuditV1] GBP location detail fetched', {
     jobId:         job.id,
     clientId,
-    gbpLocationId,
+    locationId,
     hasDetail:     detail !== null,
-    title:         detail?.title          ?? '(missing)',
+    title:         detail?.title            ?? '(missing)',
     locationState: detail?.openInfo?.status ?? null,
   })
 
   // ── 5. Fetch review stats ──────────────────────────────────────────────────
-  const reviews = await fetchReviewStats(gbp, location.location_id, gbpLocationId, detail)
+  const reviews = await fetchReviewStats(gbp, location.location_id, locationId, detail)
 
   console.log('[profileAuditV1] Review stats loaded', {
-    jobId:         job.id,
+    jobId:     job.id,
     clientId,
-    gbpLocationId,
-    count:         reviews.count,
-    avgRating:     reviews.averageRating,
-    unreplied:     reviews.unrepliedCount,
-    source:        reviews.source,
+    locationId,
+    count:     reviews.count,
+    avgRating: reviews.averageRating,
+    unreplied: reviews.unrepliedCount,
+    source:    reviews.source,
   })
 
   // ── 6. Fetch performance baseline (last 28 days) ───────────────────────────
-  const performance = await fetchPerformanceBaseline(gbpLocationId)
+  const performance = await fetchPerformanceBaseline(locationId)
 
   console.log('[profileAuditV1] Performance baseline loaded', {
     jobId:        job.id,
     clientId,
-    gbpLocationId,
+    locationId,
     viewsTotal:   performance.viewsTotal,
     daysWithData: performance.daysWithData,
     partial:      performance.partial ?? false,
   })
 
   // ── 7. Check for recent post ───────────────────────────────────────────────
-  const recentPost = await hasRecentPost(gbpLocationId)
+  const recentPost = await hasRecentPost(locationId)
 
   console.log('[profileAuditV1] Recent post check', {
-    jobId:         job.id,
+    jobId:      job.id,
     clientId,
-    gbpLocationId,
+    locationId,
     recentPost,
   })
 
@@ -859,9 +872,9 @@ export async function handleProfileAuditV1(job: Job): Promise<void> {
   const score               = dimensions.completeness + dimensions.reputation + dimensions.activity
 
   console.log('[profileAuditV1] Score computed', {
-    jobId:         job.id,
+    jobId:      job.id,
     clientId,
-    gbpLocationId,
+    locationId,
     score,
     dimensions,
   })
@@ -870,17 +883,17 @@ export async function handleProfileAuditV1(job: Job): Promise<void> {
   const recommendations = generateRecommendations(ctx)
 
   console.log('[profileAuditV1] Recommendations generated', {
-    jobId:         job.id,
+    jobId:        job.id,
     clientId,
-    gbpLocationId,
-    count:         recommendations.length,
-    highSeverity:  recommendations.filter(r => r.severity === 'high').length,
+    locationId,
+    count:        recommendations.length,
+    highSeverity: recommendations.filter(r => r.severity === 'high').length,
   })
 
   // ── 10. Build audit_json snapshot ─────────────────────────────────────────
   const auditJson: Record<string, unknown> = {
-    gbp_resource_name:    location.location_id,
-    location_db_name:     location.name,
+    gbp_resource_name: location.location_id,
+    location_db_name:  location.name,
     audit_version:        'v1',
     audited_at:           new Date().toISOString(),
     score_dimensions:     dimensions,
@@ -906,7 +919,7 @@ export async function handleProfileAuditV1(job: Job): Promise<void> {
   // ── 11. Write audit row ────────────────────────────────────────────────────
   const auditId = await writeAuditRow(
     clientId,
-    gbpLocationId,
+    locationId,
     score,
     auditJson,
     recommendations,
@@ -915,7 +928,7 @@ export async function handleProfileAuditV1(job: Job): Promise<void> {
   console.log('[profileAuditV1] Audit complete', {
     jobId:               job.id,
     clientId,
-    gbpLocationId,
+    locationId,
     gbpResourceName:     location.location_id,
     auditId,
     score,

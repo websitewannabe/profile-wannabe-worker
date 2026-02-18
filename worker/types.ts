@@ -204,8 +204,17 @@ export interface ProfileAuditV1Payload {
   /** Tenant identifier — all DB queries must be scoped to this. */
   clientId: string
 
-  /** UUID primary key of the gbp_locations row to audit. */
-  gbpLocationId: string
+  /** GBP profile context — pass null when not applicable for system-initiated audits. */
+  profileId: string | null
+
+  /**
+   * UUID primary key of the gbp_locations row to audit.
+   * Named locationId to conform to the global job contract (TenantJobPayload).
+   */
+  locationId: string
+
+  /** User who triggered the job — pass null for system-initiated audits. */
+  initiatedByUserId: string | null
 }
 
 // ─── profile_audit_v1 internal types ─────────────────────────────────────────
