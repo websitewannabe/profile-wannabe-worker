@@ -370,6 +370,39 @@ async function performRefresh(
   return { mode: 'client_oauth', accessToken: tokenData.access_token, oauthProject }
 }
 
+// ─── getValidAccessTokenForClient ────────────────────────────────────────────
+
+/**
+ * Returns a valid, decrypted access token for the given client by resolving
+ * their google_connections row.
+ *
+ * This is the single authorised token-resolution path for the worker.
+ * Only `client_oauth` connections are supported — the worker carries no
+ * global agency refresh token and never falls back to one.
+ *
+ * @throws {GoogleConnectionMissingError} if no google_connections row exists.
+ * @throws {GoogleConnectionInvalidError} if tokens are absent, corrupt, or revoked.
+ * @throws {Error} if connection_type is "agency_master" or unrecognised.
+ */
+export async function getValidAccessTokenForClient(
+  clientId: string,
+): Promise<{ accessToken: string; oauthProject: OAuthProject }> {
+  const connection = await loadGoogleConnection(clientId)
+
+  if (connection.mode === 'agency_master') {
+    throw new Error(
+      `[google/connection] agency_master connections are not supported in this worker. ` +
+      `clientId=${clientId} must use connection_type="client_oauth". ` +
+      `Update the google_connections row or re-run the client OAuth flow.`,
+    )
+  }
+
+  return {
+    accessToken:  connection.accessToken,
+    oauthProject: connection.oauthProject,
+  }
+}
+
 // ─── isExpiredOrNearExpiry ────────────────────────────────────────────────────
 
 /**

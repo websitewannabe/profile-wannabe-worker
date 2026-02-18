@@ -2,20 +2,13 @@
  * worker/lib/google/authFactory.ts
  *
  * Factory that returns a fully-configured Business Profile API client for a
- * given client, handling both connection modes and OAuth projects transparently.
+ * given client, resolving their OAuth token exclusively from google_connections.
  *
- * ─── Connection modes ─────────────────────────────────────────────────────────
- *   agency_master  — The worker uses the agency's own Google credentials.
- *                    The agency refresh token (GOOGLE_AGENCY_REFRESH_TOKEN) is
- *                    exchanged using the OAuth project specified in the
- *                    google_connections.oauth_project column.  The resulting
- *                    access token is cached in-process per project.
- *
- *   client_oauth   — The client completed their own OAuth flow.  Tokens are
- *                    stored encrypted in Supabase.  loadGoogleConnection()
- *                    handles decryption, expiry checking, refresh (using the
- *                    correct project credentials), and DB persistence before
- *                    the client is returned.
+ * ─── Token resolution ─────────────────────────────────────────────────────────
+ *   All token resolution flows through getValidAccessTokenForClient(clientId),
+ *   which reads from the google_connections table keyed by client_id.
+ *   Only client_oauth connections are supported; agency_master rows throw
+ *   immediately so no global credential env var is ever required.
  *
  * ─── OAuth projects ───────────────────────────────────────────────────────────
  *   agency  — Uses GOOGLE_OAUTH_CLIENT_ID_AGENCY / GOOGLE_OAUTH_CLIENT_SECRET_AGENCY.
@@ -35,8 +28,8 @@
  *   GOOGLE_OAUTH_CLIENT_SECRET_AGENCY — OAuth client secret for the agency project.
  *   GOOGLE_OAUTH_CLIENT_ID_SAAS       — OAuth client ID for the saas project.
  *   GOOGLE_OAUTH_CLIENT_SECRET_SAAS   — OAuth client secret for the saas project.
- *   GOOGLE_AGENCY_REFRESH_TOKEN       — Refresh token for the agency's own Google
- *                                       account (agency_master connections only).
+ *
+ *   GOOGLE_AGENCY_REFRESH_TOKEN is NOT used and must NOT be set as a dependency.
  *
  * ─── Usage ────────────────────────────────────────────────────────────────────
  *   const gbp = await getBusinessProfileClientForClient(clientId)
@@ -47,8 +40,8 @@
  *   )
  */
 
-import { loadGoogleConnection, resolveOAuthCredentials } from './connection'
-import type { OAuthProject }                             from './connection'
+import { getValidAccessTokenForClient } from './connection'
+import type { OAuthProject }            from './connection'
 
 // ─── GbpApiError ─────────────────────────────────────────────────────────────
 
@@ -74,23 +67,6 @@ export class GbpApiError extends Error {
 
 const GBP_BASE_URL = 'https://mybusinessaccountmanagement.googleapis.com/v1'
 
-// ─── Google token constants ───────────────────────────────────────────────────
-
-const GOOGLE_TOKEN_ENDPOINT   = 'https://oauth2.googleapis.com/token'
-const NEAR_EXPIRY_BUFFER_SECS = 300   // refresh 5 min before actual expiry
-
-// ─── Per-project agency token cache ──────────────────────────────────────────
-//
-// Keyed by OAuthProject so each project's access token is cached independently.
-// Module-scoped to persist for the worker process lifetime.
-
-interface CachedToken {
-  readonly value:     string
-  readonly expiresAt: number   // ms epoch
-}
-
-const _agencyTokenCache = new Map<OAuthProject, CachedToken>()
-
 // ─── BusinessProfileClient ────────────────────────────────────────────────────
 
 /**
@@ -106,8 +82,8 @@ const _agencyTokenCache = new Map<OAuthProject, CachedToken>()
 export class BusinessProfileClient {
   readonly #accessToken: string
 
-  /** Connection mode — safe to log and inspect. */
-  readonly mode: 'agency_master' | 'client_oauth'
+  /** Connection mode — always client_oauth; safe to log and inspect. */
+  readonly mode: 'client_oauth'
 
   /** Client tenant identifier — safe to log and inspect. */
   readonly clientId: string
@@ -117,12 +93,11 @@ export class BusinessProfileClient {
 
   constructor(opts: {
     accessToken:  string
-    mode:         'agency_master' | 'client_oauth'
     clientId:     string
     oauthProject: OAuthProject
   }) {
     this.#accessToken = opts.accessToken
-    this.mode         = opts.mode
+    this.mode         = 'client_oauth'
     this.clientId     = opts.clientId
     this.oauthProject = opts.oauthProject
   }
@@ -234,54 +209,23 @@ export class BusinessProfileClient {
 
 /**
  * Returns a BusinessProfileClient configured with a valid access token for the
- * given client, using the OAuth project specified in google_connections.
+ * given client.
  *
- * Handles both connection modes:
- *   agency_master → refreshes (and caches per project) the agency's access token.
- *   client_oauth  → loadGoogleConnection() decrypts, refreshes if expired using
- *                   the correct project credentials, and persists the updated
- *                   token back to Supabase before returning.
+ * Token resolution goes exclusively through getValidAccessTokenForClient(clientId),
+ * which reads from google_connections (client_oauth mode only).
+ * agency_master connections are rejected — this worker does not carry a global
+ * agency refresh token.
  *
- * @throws if the google_connections row is missing, credentials are invalid or
- *         revoked, or a required env var is absent.
+ * @throws if the google_connections row is missing, connection_type is
+ *         agency_master, credentials are invalid/revoked, or a required env
+ *         var is absent.
  *         For graceful-stop behaviour (set status + return null), use
  *         getGoogleAuthForClient() from auth.ts instead.
  */
 export async function getBusinessProfileClientForClient(
   clientId: string,
 ): Promise<BusinessProfileClient> {
-  const connection = await loadGoogleConnection(clientId)
-
-  // ── agency_master path ────────────────────────────────────────────────────
-
-  if (connection.mode === 'agency_master') {
-    const { oauthProject } = connection
-
-    console.log('[google/authFactory] agency_master — loading agency credentials', {
-      clientId,
-      mode:         'agency_master',
-      oauthProject,
-    })
-
-    const agencyAccessToken = await getAgencyAccessToken(oauthProject)
-
-    return new BusinessProfileClient({
-      accessToken:  agencyAccessToken,
-      mode:         'agency_master',
-      clientId,
-      oauthProject,
-    })
-  }
-
-  // ── client_oauth path ─────────────────────────────────────────────────────
-  //
-  // loadGoogleConnection() has already:
-  //   1. Decrypted the refresh token
-  //   2. Resolved project-specific OAuth credentials
-  //   3. Checked expiry and refreshed the access token via Google if needed
-  //   4. Persisted the new encrypted_access_token + token_expires_at to Supabase
-
-  const { oauthProject } = connection
+  const { accessToken, oauthProject } = await getValidAccessTokenForClient(clientId)
 
   console.log('[google/authFactory] client_oauth — connection resolved', {
     clientId,
@@ -290,119 +234,8 @@ export async function getBusinessProfileClientForClient(
   })
 
   return new BusinessProfileClient({
-    accessToken:  connection.accessToken,
-    mode:         'client_oauth',
+    accessToken,
     clientId,
     oauthProject,
   })
-}
-
-// ─── Agency token management ──────────────────────────────────────────────────
-
-/**
- * Returns a valid access token for the agency's own Google account, using the
- * specified OAuth project's credentials for the token refresh call.
- *
- * Access tokens are cached per-project.  Each cached entry is validated against
- * a NEAR_EXPIRY_BUFFER_SECS early-refresh window before being returned, so
- * callers never receive a token that expires mid-request.
- *
- * The token value is never logged.  Only the project label appears in logs.
- *
- * @throws if GOOGLE_AGENCY_REFRESH_TOKEN is absent, project credentials are
- *         missing, or the Google token endpoint rejects the request.
- */
-async function getAgencyAccessToken(oauthProject: OAuthProject): Promise<string> {
-  // ── Return cached token if still valid ────────────────────────────────────
-  const cached = _agencyTokenCache.get(oauthProject)
-
-  if (cached) {
-    const bufferMs        = NEAR_EXPIRY_BUFFER_SECS * 1000
-    const effectiveExpiry = cached.expiresAt - bufferMs
-
-    if (Date.now() < effectiveExpiry) {
-      return cached.value
-    }
-
-    // Entry is expired or within buffer — evict and refresh.
-    _agencyTokenCache.delete(oauthProject)
-  }
-
-  // ── Resolve credentials ───────────────────────────────────────────────────
-  const agencyRefreshToken = process.env.GOOGLE_AGENCY_REFRESH_TOKEN
-  if (!agencyRefreshToken) {
-    throw new Error(
-      '[google/authFactory] GOOGLE_AGENCY_REFRESH_TOKEN is required for ' +
-      'agency_master connections but is not set.',
-    )
-  }
-
-  // resolveOAuthCredentials validates both vars and throws with the specific
-  // env var name if either is missing — no need to duplicate that check here.
-  const creds = resolveOAuthCredentials(oauthProject)
-
-  // ── Refresh via Google token endpoint ─────────────────────────────────────
-  console.log('[google/authFactory] Refreshing agency access token', {
-    oauthProject: creds.projectLabel,
-  })
-
-  const body = new URLSearchParams({
-    grant_type:    'refresh_token',
-    refresh_token: agencyRefreshToken,
-    client_id:     creds.clientId,
-    client_secret: creds.clientSecret,
-  })
-
-  let res: Response
-  try {
-    res = await fetch(GOOGLE_TOKEN_ENDPOINT, {
-      method:  'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body,
-    })
-  } catch (networkErr) {
-    throw new Error(
-      '[google/authFactory] Network error refreshing agency access token: ' +
-      (networkErr instanceof Error ? networkErr.message : String(networkErr)),
-    )
-  }
-
-  if (!res.ok) {
-    // Never include the response body — it may echo back sensitive parameters.
-    throw new Error(
-      `[google/authFactory] Google rejected agency token refresh (project=${creds.projectLabel}) — ` +
-      `HTTP ${res.status} ${res.statusText}. ` +
-      `Verify GOOGLE_AGENCY_REFRESH_TOKEN and GOOGLE_OAUTH_CLIENT_ID_${oauthProject.toUpperCase()} are valid.`,
-    )
-  }
-
-  let tokenData: { access_token?: string; expires_in?: number }
-  try {
-    tokenData = await res.json() as { access_token?: string; expires_in?: number }
-  } catch {
-    throw new Error(
-      `[google/authFactory] Failed to parse Google agency token response (project=${creds.projectLabel}).`,
-    )
-  }
-
-  if (!tokenData.access_token) {
-    throw new Error(
-      `[google/authFactory] Google agency token response missing access_token (project=${creds.projectLabel}).`,
-    )
-  }
-
-  // ── Populate per-project cache ────────────────────────────────────────────
-  // expires_in is seconds; default 3600 (1 hour) if omitted.
-  const expiresInMs = (tokenData.expires_in ?? 3600) * 1000
-  const entry: CachedToken = {
-    value:     tokenData.access_token,
-    expiresAt: Date.now() + expiresInMs,
-  }
-  _agencyTokenCache.set(oauthProject, entry)
-
-  console.log('[google/authFactory] Agency access token refreshed and cached', {
-    oauthProject: creds.projectLabel,
-  })
-
-  return entry.value
 }
